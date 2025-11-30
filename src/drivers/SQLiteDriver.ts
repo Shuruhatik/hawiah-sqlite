@@ -1,27 +1,7 @@
 import Database from 'better-sqlite3';
 import { IDriver, Query, Data } from '../interfaces/IDriver';
 
-/**
- * SQLite driver configuration options
- */
-export interface SQLiteDriverOptions {
-    /**
-     * Path to the SQLite database file
-     * Example: './data/mydb.sqlite'
-     * Use ':memory:' for in-memory database
-     */
-    filename: string;
 
-    /**
-     * Table name to use
-     */
-    tableName: string;
-
-    /**
-     * Additional better-sqlite3 options
-     */
-    options?: Database.Options;
-}
 
 /**
  * Driver implementation for SQLite using better-sqlite3.
@@ -29,18 +9,20 @@ export interface SQLiteDriverOptions {
  */
 export class SQLiteDriver implements IDriver {
     private db: Database.Database | null = null;
-    private filename: string;
+    private filePath: string;
     private tableName: string;
     private options: Database.Options;
 
     /**
      * Creates a new instance of SQLiteDriver
-     * @param options - SQLite driver configuration options
+     * @param filePath - Path to the SQLite database file
+     * @param tableName - Table name to use
+     * @param options - Additional better-sqlite3 options
      */
-    constructor(options: SQLiteDriverOptions) {
-        this.filename = options.filename;
-        this.tableName = options.tableName;
-        this.options = options.options || {};
+    constructor(filePath: string, tableName: string, options?: Database.Options) {
+        this.filePath = filePath;
+        this.tableName = tableName;
+        this.options = options || {};
     }
 
     /**
@@ -48,7 +30,7 @@ export class SQLiteDriver implements IDriver {
      * Creates the table if it doesn't exist.
      */
     async connect(): Promise<void> {
-        this.db = new Database(this.filename, this.options);
+        this.db = new Database(this.filePath, this.options);
 
         const createTableSQL = `
             CREATE TABLE IF NOT EXISTS ${this.tableName} (
