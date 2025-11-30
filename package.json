@@ -1,0 +1,48 @@
+{
+  "name": "@hawiah/sqlite",
+  "version": "0.1.0",
+  "description": "SQLite driver for Hawiah - lightweight and fast data persistence with better-sqlite3",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node test/example.js"
+  },
+  "keywords": [
+    "sqlite",
+    "sqlite3",
+    "better-sqlite3",
+    "database",
+    "driver",
+    "hawiah",
+    "schema-less",
+    "lightweight",
+    "fast",
+    "sql"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shuruhatik/hawiah-sqlite.git"
+  },
+  "homepage": "https://github.com/Shuruhatik/hawiah-sqlite#readme",
+  "bugs": {
+    "url": "https://github.com/Shuruhatik/hawiah-sqlite/issues"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "better-sqlite3": "^12.4.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
