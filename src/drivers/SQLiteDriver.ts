@@ -1,8 +1,6 @@
 import Database from 'better-sqlite3';
 import { IDriver, Query, Data } from '../interfaces/IDriver';
 
-
-
 /**
  * Driver implementation for SQLite using better-sqlite3.
  * Provides a schema-less interface to SQLite tables.
