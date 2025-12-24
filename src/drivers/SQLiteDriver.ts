@@ -10,6 +10,8 @@ export class SQLiteDriver implements IDriver {
     private filePath: string;
     private tableName: string;
     private options: Database.Options;
+    private schema: any = null;
+    public dbType: 'sql' | 'nosql' = 'sql';
 
     /**
      * Creates a new instance of SQLiteDriver
@@ -24,20 +26,50 @@ export class SQLiteDriver implements IDriver {
     }
 
     /**
+     * Sets the schema for the driver.
+     * Switches the driver to SQL mode.
+     * @param schema - The schema definition
+     */
+    setSchema(schema: any): void {
+        this.schema = schema;
+        this.dbType = 'sql';
+    }
+
+    /**
      * Connects to the SQLite database.
      * Creates the table if it doesn't exist.
      */
     async connect(): Promise<void> {
         this.db = new Database(this.filePath, this.options);
 
-        const createTableSQL = `
-            CREATE TABLE IF NOT EXISTS ${this.tableName} (
-                _id TEXT PRIMARY KEY,
-                _data TEXT NOT NULL,
-                _createdAt TEXT NOT NULL,
-                _updatedAt TEXT NOT NULL
-            )
-        `;
+        let createTableSQL = '';
+
+        if (this.schema && this.dbType === 'sql') {
+            const columns = Object.entries(this.schema).map(([key, type]) => {
+                const sqlType = this.mapHawiahTypeToSQL(type);
+                return `${key} ${sqlType}`;
+            }).join(',\n                ');
+
+            createTableSQL = `
+                CREATE TABLE IF NOT EXISTS ${this.tableName} (
+                    _id TEXT PRIMARY KEY,
+                    ${columns},
+                    _extras TEXT,
+                    _createdAt TEXT NOT NULL,
+                    _updatedAt TEXT NOT NULL
+                )
+            `;
+        } else {
+            createTableSQL = `
+                CREATE TABLE IF NOT EXISTS ${this.tableName} (
+                    _id TEXT PRIMARY KEY,
+                    _data TEXT NOT NULL,
+                    _createdAt TEXT NOT NULL,
+                    _updatedAt TEXT NOT NULL
+                )
+            `;
+        }
+
         this.db.exec(createTableSQL);
 
         this.db.exec(`CREATE INDEX IF NOT EXISTS idx_createdAt ON ${this.tableName}(_createdAt)`);
@@ -63,19 +95,36 @@ export class SQLiteDriver implements IDriver {
         this.ensureConnected();
 
         const id = this.generateId();
+        const now = new Date().toISOString();
         const record = {
             ...data,
             _id: id,
-            _createdAt: new Date().toISOString(),
-            _updatedAt: new Date().toISOString(),
+            _createdAt: now,
+            _updatedAt: now,
         };
 
-        const stmt = this.db!.prepare(`
-            INSERT INTO ${this.tableName} (_id, _data, _createdAt, _updatedAt)
-            VALUES (?, ?, ?, ?)
-        `);
+        if (this.schema && this.dbType === 'sql') {
+            const { schemaData, extraData } = this.splitData(record);
 
-        stmt.run(id, JSON.stringify(record), record._createdAt, record._updatedAt);
+            const schemaKeys = Object.keys(schemaData);
+            const schemaValues = Object.values(schemaData);
+
+            const cols = ['_id', ...schemaKeys, '_extras', '_createdAt', '_updatedAt'];
+            const placeholders = cols.map(() => '?').join(', ');
+
+            const stmt = this.db!.prepare(`
+                INSERT INTO ${this.tableName} (${cols.join(', ')})
+                VALUES (${placeholders})
+            `);
+
+            stmt.run(id, ...schemaValues, JSON.stringify(extraData), now, now);
+        } else {
+            const stmt = this.db!.prepare(`
+                INSERT INTO ${this.tableName} (_id, _data, _createdAt, _updatedAt)
+                VALUES (?, ?, ?, ?)
+            `);
+            stmt.run(id, JSON.stringify(record), now, now);
+        }
 
         return record;
     }
@@ -88,14 +137,33 @@ export class SQLiteDriver implements IDriver {
     async get(query: Query): Promise<Data[]> {
         this.ensureConnected();
 
-        if (Object.keys(query).length === 0) {
-            const stmt = this.db!.prepare(`SELECT _data FROM ${this.tableName}`);
-            const rows = stmt.all() as Array<{ _data: string }>;
-            return rows.map(row => JSON.parse(row._data));
-        }
+        let rows: any[];
 
-        const allRecords = await this.get({});
-        return allRecords.filter(record => this.matchesQuery(record, query));
+        if (this.schema && this.dbType === 'sql') {
+            const stmt = this.db!.prepare(`SELECT * FROM ${this.tableName}`);
+            rows = stmt.all();
+
+            // Merge extras
+            const records = rows.map(row => this.mergeData(row));
+            if (Object.keys(query).length > 0) {
+                return records.filter(record => this.matchesQuery(record, query));
+            }
+            return records;
+        } else {
+            if (Object.keys(query).length === 0) {
+                const stmt = this.db!.prepare(`SELECT _data FROM ${this.tableName}`);
+                const rows = stmt.all() as Array<{ _data: string }>;
+                return rows.map(row => JSON.parse(row._data));
+            }
+
+            // For legacy, we fall back to fetching all and filtering in memory
+            // unless we want to recurse. But fetching all is what the logic did.
+            // Recursing calls get({}) which hits the block above.
+            const stmt = this.db!.prepare(`SELECT _data FROM ${this.tableName}`);
+            const allRows = stmt.all() as Array<{ _data: string }>;
+            const allRecords = allRows.map(row => JSON.parse(row._data));
+            return allRecords.filter(record => this.matchesQuery(record, query));
+        }
     }
 
     /**
@@ -107,9 +175,15 @@ export class SQLiteDriver implements IDriver {
         this.ensureConnected();
 
         if (query._id) {
-            const stmt = this.db!.prepare(`SELECT _data FROM ${this.tableName} WHERE _id = ?`);
-            const row = stmt.get(query._id) as { _data: string } | undefined;
-            return row ? JSON.parse(row._data) : null;
+            if (this.schema && this.dbType === 'sql') {
+                const stmt = this.db!.prepare(`SELECT * FROM ${this.tableName} WHERE _id = ?`);
+                const row = stmt.get(query._id);
+                return row ? this.mergeData(row) : null;
+            } else {
+                const stmt = this.db!.prepare(`SELECT _data FROM ${this.tableName} WHERE _id = ?`);
+                const row = stmt.get(query._id) as { _data: string } | undefined;
+                return row ? JSON.parse(row._data) : null;
+            }
         }
 
         const results = await this.get(query);
@@ -128,12 +202,6 @@ export class SQLiteDriver implements IDriver {
         const records = await this.get(query);
         let count = 0;
 
-        const stmt = this.db!.prepare(`
-            UPDATE ${this.tableName}
-            SET _data = ?, _updatedAt = ?
-            WHERE _id = ?
-        `);
-
         for (const record of records) {
             const updatedRecord: any = {
                 ...record,
@@ -141,10 +209,28 @@ export class SQLiteDriver implements IDriver {
                 _updatedAt: new Date().toISOString(),
             };
 
+            // Preserve ID and CreatedAt
             updatedRecord._id = record._id;
             updatedRecord._createdAt = record._createdAt;
 
-            stmt.run(JSON.stringify(updatedRecord), updatedRecord._updatedAt, record._id);
+            if (this.schema && this.dbType === 'sql') {
+                const { schemaData, extraData } = this.splitData(updatedRecord);
+                const schemaKeys = Object.keys(schemaData);
+                const schemaValues = Object.values(schemaData);
+
+                const setClause = schemaKeys.map(k => `${k} = ?`).join(', ');
+                const sql = `UPDATE ${this.tableName} SET ${setClause}, _extras = ?, _updatedAt = ? WHERE _id = ?`;
+
+                const stmt = this.db!.prepare(sql);
+                stmt.run(...schemaValues, JSON.stringify(extraData), updatedRecord._updatedAt, record._id);
+            } else {
+                const stmt = this.db!.prepare(`
+                    UPDATE ${this.tableName}
+                    SET _data = ?, _updatedAt = ?
+                    WHERE _id = ?
+                `);
+                stmt.run(JSON.stringify(updatedRecord), updatedRecord._updatedAt, record._id);
+            }
             count++;
         }
 
@@ -322,5 +408,64 @@ export class SQLiteDriver implements IDriver {
     rollback(): void {
         this.ensureConnected();
         this.db!.exec('ROLLBACK');
+    }
+
+    /**
+     * Maps Hawiah types to SQLite types
+     */
+    private mapHawiahTypeToSQL(type: any): string {
+        let t = type;
+        if (typeof type === 'object' && type !== null && type.type) {
+            t = type.type;
+        }
+
+        t = String(t).toUpperCase();
+
+        if (t.includes('STRING') || t.includes('TEXT')) return 'TEXT';
+        if (t.includes('NUMBER')) {
+            if (t.includes('INT')) return 'INTEGER';
+            return 'REAL';
+        }
+        if (t.includes('BOOLEAN')) return 'INTEGER';
+        if (t.includes('DATE')) return 'TEXT';
+        if (t.includes('BLOB') || t.includes('BUFFER')) return 'BLOB';
+
+        return 'TEXT';
+    }
+
+    /**
+     * Splits data into schema columns and extra data
+     */
+    private splitData(data: Data): { schemaData: Data, extraData: Data } {
+        if (!this.schema) return { schemaData: {}, extraData: data };
+
+        const schemaData: Data = {};
+        const extraData: Data = {};
+
+        for (const [key, value] of Object.entries(data)) {
+            if (key in this.schema) {
+                schemaData[key] = value;
+            } else if (!['_id', '_createdAt', '_updatedAt'].includes(key)) {
+                extraData[key] = value;
+            }
+        }
+
+        return { schemaData, extraData };
+    }
+
+    /**
+     * Merges schema columns and extra data
+     */
+    private mergeData(row: any): Data {
+        const { _extras, ...rest } = row;
+        let extras = {};
+        if (_extras) {
+            try {
+                extras = JSON.parse(_extras);
+            } catch (e) {
+                // Return row as is if parse fails, or empty extras
+            }
+        }
+        return { ...rest, ...extras };
     }
 }

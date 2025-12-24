@@ -1,6 +1,6 @@
 {
   "name": "@hawiah/sqlite",
-  "version": "0.2.3",
+  "version": "0.3.3",
   "description": "SQLite driver for Hawiah - lightweight and fast data persistence with better-sqlite3",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -27,7 +27,7 @@
     "type": "git",
     "url": "git+https://github.com/Shuruhatik/hawiah-sqlite.git"
   },
-  "homepage": "https://github.com/Shuruhatik/hawiah-sqlite#readme",
+  "homepage": "https://hawiah.js.org",
   "bugs": {
     "url": "https://github.com/Shuruhatik/hawiah-sqlite/issues"
   },
