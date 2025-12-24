@@ -11,15 +11,15 @@ export class SQLiteDriver implements IDriver {
     private tableName: string;
     private options: Database.Options;
     private schema: any = null;
-    public dbType: 'sql' | 'nosql' = 'sql';
+    public dbType: 'sql' | 'nosql' = 'nosql'; // Default to nosql behavior until schema is set
 
     /**
      * Creates a new instance of SQLiteDriver
      * @param filePath - Path to the SQLite database file
-     * @param tableName - Table name to use
+     * @param tableName - Table name to use (default: 'data')
      * @param options - Additional better-sqlite3 options
      */
-    constructor(filePath: string, tableName: string, options?: Database.Options) {
+    constructor(filePath: string, tableName: string = 'data', options?: Database.Options) {
         this.filePath = filePath;
         this.tableName = tableName;
         this.options = options || {};
@@ -28,7 +28,7 @@ export class SQLiteDriver implements IDriver {
     /**
      * Sets the schema for the driver.
      * Switches the driver to SQL mode.
-     * @param schema - The schema definition
+     * @param schema - The schema instance
      */
     setSchema(schema: any): void {
         this.schema = schema;
@@ -45,7 +45,12 @@ export class SQLiteDriver implements IDriver {
         let createTableSQL = '';
 
         if (this.schema && this.dbType === 'sql') {
-            const columns = Object.entries(this.schema).map(([key, type]) => {
+            // FIX: Use getDefinition() to get the raw schema object
+            const definition = typeof this.schema.getDefinition === 'function' 
+                                ? this.schema.getDefinition() 
+                                : this.schema;
+
+            const columns = Object.entries(definition).map(([key, type]) => {
                 const sqlType = this.mapHawiahTypeToSQL(type);
                 return `${key} ${sqlType}`;
             }).join(',\n                ');
@@ -112,12 +117,17 @@ export class SQLiteDriver implements IDriver {
             const cols = ['_id', ...schemaKeys, '_extras', '_createdAt', '_updatedAt'];
             const placeholders = cols.map(() => '?').join(', ');
 
+            // Handle boolean conversion for SQLite (0/1)
+            const finalValues = [id, ...schemaValues, JSON.stringify(extraData), now, now].map(v => 
+                typeof v === 'boolean' ? (v ? 1 : 0) : v
+            );
+
             const stmt = this.db!.prepare(`
                 INSERT INTO ${this.tableName} (${cols.join(', ')})
                 VALUES (${placeholders})
             `);
 
-            stmt.run(id, ...schemaValues, JSON.stringify(extraData), now, now);
+            stmt.run(...finalValues);
         } else {
             const stmt = this.db!.prepare(`
                 INSERT INTO ${this.tableName} (_id, _data, _createdAt, _updatedAt)
@@ -150,18 +160,10 @@ export class SQLiteDriver implements IDriver {
             }
             return records;
         } else {
-            if (Object.keys(query).length === 0) {
-                const stmt = this.db!.prepare(`SELECT _data FROM ${this.tableName}`);
-                const rows = stmt.all() as Array<{ _data: string }>;
-                return rows.map(row => JSON.parse(row._data));
-            }
-
-            // For legacy, we fall back to fetching all and filtering in memory
-            // unless we want to recurse. But fetching all is what the logic did.
-            // Recursing calls get({}) which hits the block above.
             const stmt = this.db!.prepare(`SELECT _data FROM ${this.tableName}`);
             const allRows = stmt.all() as Array<{ _data: string }>;
             const allRecords = allRows.map(row => JSON.parse(row._data));
+            if (Object.keys(query).length === 0) return allRecords;
             return allRecords.filter(record => this.matchesQuery(record, query));
         }
     }
@@ -209,20 +211,30 @@ export class SQLiteDriver implements IDriver {
                 _updatedAt: new Date().toISOString(),
             };
 
-            // Preserve ID and CreatedAt
-            updatedRecord._id = record._id;
-            updatedRecord._createdAt = record._createdAt;
-
             if (this.schema && this.dbType === 'sql') {
                 const { schemaData, extraData } = this.splitData(updatedRecord);
                 const schemaKeys = Object.keys(schemaData);
                 const schemaValues = Object.values(schemaData);
 
                 const setClause = schemaKeys.map(k => `${k} = ?`).join(', ');
-                const sql = `UPDATE ${this.tableName} SET ${setClause}, _extras = ?, _updatedAt = ? WHERE _id = ?`;
+                
+                // Construct SQL carefully. If no schema keys updated, only update extras/time
+                let sql = `UPDATE ${this.tableName} SET `;
+                const params = [];
+                
+                if (schemaKeys.length > 0) {
+                    sql += `${setClause}, `;
+                    params.push(...schemaValues);
+                }
+                
+                sql += `_extras = ?, _updatedAt = ? WHERE _id = ?`;
+                params.push(JSON.stringify(extraData), updatedRecord._updatedAt, record._id);
+
+                // Convert booleans
+                 const finalParams = params.map(v => typeof v === 'boolean' ? (v ? 1 : 0) : v);
 
                 const stmt = this.db!.prepare(sql);
-                stmt.run(...schemaValues, JSON.stringify(extraData), updatedRecord._updatedAt, record._id);
+                stmt.run(...finalParams);
             } else {
                 const stmt = this.db!.prepare(`
                     UPDATE ${this.tableName}
@@ -277,12 +289,15 @@ export class SQLiteDriver implements IDriver {
     async count(query: Query): Promise<number> {
         this.ensureConnected();
 
+        // Optimized count for empty query only (Native SQL)
         if (Object.keys(query).length === 0) {
             const stmt = this.db!.prepare(`SELECT COUNT(*) as count FROM ${this.tableName}`);
             const result = stmt.get() as { count: number };
             return result.count;
         }
 
+        // For filtered count, we currently reuse get() for consistency with memory/nosql approach
+        // To optimize this for SQL, we'd need a query builder to translate `query` object to SQL WHERE clause.
         const results = await this.get(query);
         return results.length;
     }
@@ -414,6 +429,7 @@ export class SQLiteDriver implements IDriver {
      * Maps Hawiah types to SQLite types
      */
     private mapHawiahTypeToSQL(type: any): string {
+        // Handle full SchemaField object { type: 'string', required: true }
         let t = type;
         if (typeof type === 'object' && type !== null && type.type) {
             t = type.type;
@@ -421,7 +437,7 @@ export class SQLiteDriver implements IDriver {
 
         t = String(t).toUpperCase();
 
-        if (t.includes('STRING') || t.includes('TEXT')) return 'TEXT';
+        if (t.includes('STRING') || t.includes('TEXT') || t.includes('EMAIL') || t.includes('URL') || t.includes('UUID') || t.includes('CHAR')) return 'TEXT';
         if (t.includes('NUMBER')) {
             if (t.includes('INT')) return 'INTEGER';
             return 'REAL';
@@ -429,7 +445,8 @@ export class SQLiteDriver implements IDriver {
         if (t.includes('BOOLEAN')) return 'INTEGER';
         if (t.includes('DATE')) return 'TEXT';
         if (t.includes('BLOB') || t.includes('BUFFER')) return 'BLOB';
-
+        
+        // JSON, OBJECT, ARRAY, ANY -> stored as TEXT/JSON
         return 'TEXT';
     }
 
@@ -439,11 +456,17 @@ export class SQLiteDriver implements IDriver {
     private splitData(data: Data): { schemaData: Data, extraData: Data } {
         if (!this.schema) return { schemaData: {}, extraData: data };
 
+        // FIX: Use getDefinition()
+        const definition = typeof this.schema.getDefinition === 'function' 
+                            ? this.schema.getDefinition() 
+                            : this.schema;
+
         const schemaData: Data = {};
         const extraData: Data = {};
 
         for (const [key, value] of Object.entries(data)) {
-            if (key in this.schema) {
+            // Check if key is in definitions
+            if (key in definition) {
                 schemaData[key] = value;
             } else if (!['_id', '_createdAt', '_updatedAt'].includes(key)) {
                 extraData[key] = value;
@@ -466,6 +489,25 @@ export class SQLiteDriver implements IDriver {
                 // Return row as is if parse fails, or empty extras
             }
         }
+        
+        // Convert SQLite (0/1) back to boolean if needed?
+        // SQLite stores boolean as 0/1. If schema says boolean, we should technically cast back.
+        // For simplicity, we return as is (0/1 is truthy/falsy in JS often enough), but strictly:
+        if (this.schema) {
+             const definition = typeof this.schema.getDefinition === 'function' 
+                            ? this.schema.getDefinition() 
+                            : this.schema;
+             for (const key in rest) {
+                 if (definition[key]) {
+                      let type = definition[key];
+                      if (typeof type === 'object' && type.type) type = type.type;
+                      if (type === 'boolean' && typeof rest[key] === 'number') {
+                          rest[key] = rest[key] === 1;
+                      }
+                 }
+             }
+        }
+
         return { ...rest, ...extras };
     }
 }
