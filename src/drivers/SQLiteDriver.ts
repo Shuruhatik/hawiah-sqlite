@@ -3,7 +3,7 @@ import { IDriver, Query, Data } from '../interfaces/IDriver';
 
 /**
  * Driver implementation for SQLite using better-sqlite3.
- * Provides a schema-less interface to SQLite tables.
+ * Provides a schema-less interface to SQLite tables, with optional Schema support for optimized storage.
  */
 export class SQLiteDriver implements IDriver {
     private db: Database.Database | null = null;
@@ -11,7 +11,12 @@ export class SQLiteDriver implements IDriver {
     private tableName: string;
     private options: Database.Options;
     private schema: any = null;
-    public dbType: 'sql' | 'nosql' = 'nosql'; // Default to nosql behavior until schema is set
+    
+    /**
+     * Database type (sql or nosql).
+     * Defaults to 'nosql' until a schema is set via setSchema().
+     */
+    public dbType: 'sql' | 'nosql' = 'nosql';
 
     /**
      * Creates a new instance of SQLiteDriver
@@ -27,7 +32,7 @@ export class SQLiteDriver implements IDriver {
 
     /**
      * Sets the schema for the driver.
-     * Switches the driver to SQL mode.
+     * Switches the driver to SQL mode to use real columns.
      * @param schema - The schema instance
      */
     setSchema(schema: any): void {
@@ -37,7 +42,7 @@ export class SQLiteDriver implements IDriver {
 
     /**
      * Connects to the SQLite database.
-     * Creates the table if it doesn't exist.
+     * Creates the table if it doesn't exist, adapting to the schema if present.
      */
     async connect(): Promise<void> {
         this.db = new Database(this.filePath, this.options);
@@ -45,7 +50,6 @@ export class SQLiteDriver implements IDriver {
         let createTableSQL = '';
 
         if (this.schema && this.dbType === 'sql') {
-            // FIX: Use getDefinition() to get the raw schema object
             const definition = typeof this.schema.getDefinition === 'function' 
                                 ? this.schema.getDefinition() 
                                 : this.schema;
@@ -92,7 +96,21 @@ export class SQLiteDriver implements IDriver {
     }
 
     /**
+     * Helper to prepare values for SQLite.
+     * Converts Booleans to 0/1, and Objects to JSON strings.
+     * @param value - The value to prepare
+     * @private
+     */
+    private prepareValue(value: any): any {
+        if (value === null || value === undefined) return null;
+        if (typeof value === 'boolean') return value ? 1 : 0;
+        if (typeof value === 'object' && !Buffer.isBuffer(value)) return JSON.stringify(value);
+        return value;
+    }
+
+    /**
      * Inserts a new record into the database.
+     * Uses real columns if schema is present, otherwise stores as JSON.
      * @param data - The data to insert
      * @returns The inserted record with ID
      */
@@ -117,10 +135,8 @@ export class SQLiteDriver implements IDriver {
             const cols = ['_id', ...schemaKeys, '_extras', '_createdAt', '_updatedAt'];
             const placeholders = cols.map(() => '?').join(', ');
 
-            // Handle boolean conversion for SQLite (0/1)
-            const finalValues = [id, ...schemaValues, JSON.stringify(extraData), now, now].map(v => 
-                typeof v === 'boolean' ? (v ? 1 : 0) : v
-            );
+            // Prepare all values (convert bools, objects, etc.)
+            const finalValues = [id, ...schemaValues, JSON.stringify(extraData), now, now].map(v => this.prepareValue(v));
 
             const stmt = this.db!.prepare(`
                 INSERT INTO ${this.tableName} (${cols.join(', ')})
@@ -153,7 +169,7 @@ export class SQLiteDriver implements IDriver {
             const stmt = this.db!.prepare(`SELECT * FROM ${this.tableName}`);
             rows = stmt.all();
 
-            // Merge extras
+            // Merge extra fields back into the main object
             const records = rows.map(row => this.mergeData(row));
             if (Object.keys(query).length > 0) {
                 return records.filter(record => this.matchesQuery(record, query));
@@ -170,6 +186,7 @@ export class SQLiteDriver implements IDriver {
 
     /**
      * Retrieves a single record matching the query.
+     * Optimized to use SQL WHERE clause for ID lookups.
      * @param query - The query criteria
      * @returns The first matching record or null
      */
@@ -194,6 +211,7 @@ export class SQLiteDriver implements IDriver {
 
     /**
      * Updates records matching the query.
+     * Updates specific columns if schema exists.
      * @param query - The query criteria
      * @param data - The data to update
      * @returns The number of updated records
@@ -218,7 +236,6 @@ export class SQLiteDriver implements IDriver {
 
                 const setClause = schemaKeys.map(k => `${k} = ?`).join(', ');
                 
-                // Construct SQL carefully. If no schema keys updated, only update extras/time
                 let sql = `UPDATE ${this.tableName} SET `;
                 const params = [];
                 
@@ -230,8 +247,8 @@ export class SQLiteDriver implements IDriver {
                 sql += `_extras = ?, _updatedAt = ? WHERE _id = ?`;
                 params.push(JSON.stringify(extraData), updatedRecord._updatedAt, record._id);
 
-                // Convert booleans
-                 const finalParams = params.map(v => typeof v === 'boolean' ? (v ? 1 : 0) : v);
+                // Prepare params
+                const finalParams = params.map(v => this.prepareValue(v));
 
                 const stmt = this.db!.prepare(sql);
                 stmt.run(...finalParams);
@@ -289,15 +306,12 @@ export class SQLiteDriver implements IDriver {
     async count(query: Query): Promise<number> {
         this.ensureConnected();
 
-        // Optimized count for empty query only (Native SQL)
         if (Object.keys(query).length === 0) {
             const stmt = this.db!.prepare(`SELECT COUNT(*) as count FROM ${this.tableName}`);
             const result = stmt.get() as { count: number };
             return result.count;
         }
 
-        // For filtered count, we currently reuse get() for consistency with memory/nosql approach
-        // To optimize this for SQL, we'd need a query builder to translate `query` object to SQL WHERE clause.
         const results = await this.get(query);
         return results.length;
     }
@@ -426,10 +440,12 @@ export class SQLiteDriver implements IDriver {
     }
 
     /**
-     * Maps Hawiah types to SQLite types
+     * Maps Hawiah types to SQLite types.
+     * @param type - The Hawiah schema type
+     * @returns The corresponding SQLite type (TEXT, INTEGER, REAL, BLOB)
+     * @private
      */
     private mapHawiahTypeToSQL(type: any): string {
-        // Handle full SchemaField object { type: 'string', required: true }
         let t = type;
         if (typeof type === 'object' && type !== null && type.type) {
             t = type.type;
@@ -446,17 +462,19 @@ export class SQLiteDriver implements IDriver {
         if (t.includes('DATE')) return 'TEXT';
         if (t.includes('BLOB') || t.includes('BUFFER')) return 'BLOB';
         
-        // JSON, OBJECT, ARRAY, ANY -> stored as TEXT/JSON
         return 'TEXT';
     }
 
     /**
-     * Splits data into schema columns and extra data
+     * Splits data into schema columns and extra data.
+     * Fields defined in schema go to real columns, others to the extras JSON.
+     * @param data - The full data object
+     * @returns Object containing separate schemaData and extraData
+     * @private
      */
     private splitData(data: Data): { schemaData: Data, extraData: Data } {
         if (!this.schema) return { schemaData: {}, extraData: data };
 
-        // FIX: Use getDefinition()
         const definition = typeof this.schema.getDefinition === 'function' 
                             ? this.schema.getDefinition() 
                             : this.schema;
@@ -465,7 +483,6 @@ export class SQLiteDriver implements IDriver {
         const extraData: Data = {};
 
         for (const [key, value] of Object.entries(data)) {
-            // Check if key is in definitions
             if (key in definition) {
                 schemaData[key] = value;
             } else if (!['_id', '_createdAt', '_updatedAt'].includes(key)) {
@@ -477,7 +494,11 @@ export class SQLiteDriver implements IDriver {
     }
 
     /**
-     * Merges schema columns and extra data
+     * Merges schema columns and extra data back into a single object.
+     * Also handles type casting (e.g. SQLite 0/1 back to boolean).
+     * @param row - The raw database row
+     * @returns The fully merged data object
+     * @private
      */
     private mergeData(row: any): Data {
         const { _extras, ...rest } = row;
@@ -486,13 +507,9 @@ export class SQLiteDriver implements IDriver {
             try {
                 extras = JSON.parse(_extras);
             } catch (e) {
-                // Return row as is if parse fails, or empty extras
             }
         }
         
-        // Convert SQLite (0/1) back to boolean if needed?
-        // SQLite stores boolean as 0/1. If schema says boolean, we should technically cast back.
-        // For simplicity, we return as is (0/1 is truthy/falsy in JS often enough), but strictly:
         if (this.schema) {
              const definition = typeof this.schema.getDefinition === 'function' 
                             ? this.schema.getDefinition() 
